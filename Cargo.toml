@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+authors = ["Hazel Rella <hazelrella11@gmail.com>"]
+edition = "2024"
+description = "N-body gravity simulation framework."
+license = "MIT OR Apache-2.0"
+
+[package]
+name = "empyrean"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+
+[dependencies]
