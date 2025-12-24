@@ -2,8 +2,8 @@ use glam::DVec3;
 
 use crate::body::Body;
 
-pub trait Integrator {
-    type State: Default;
+pub trait Integrator: Send + Sync {
+    type State: Default + Send + Sync;
 
     fn apply(
         &self,

@@ -208,6 +208,7 @@ dependencies = [
  "glam",
  "rand",
  "rand_distr",
+ "rayon",
  "thiserror",
 ]
 

@@ -1,6 +1,7 @@
 use std::iter::repeat_with;
 
 use glam::DVec3;
+use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::{
@@ -77,24 +78,58 @@ where
 
         self.octree.build(&mut self.bodies);
 
-        for (body, state) in self.bodies.iter().zip(self.states.iter_mut()) {
-            let acceleration = |position| {
-                self.octree
-                    .acceleration(position, &self.bodies, Some(body.id))
-            };
+        #[cfg(feature = "multi-thread")]
+        {
+            self.bodies
+                .par_iter()
+                .zip(self.states.par_iter_mut())
+                .for_each(|(body, state)| {
+                    let acceleration = |position| {
+                        self.octree
+                            .acceleration(position, &self.bodies, Some(body.id))
+                    };
 
-            self.integrator
-                .update(self.time_step, body, state, acceleration);
+                    self.integrator
+                        .update(self.time_step, body, state, acceleration);
+                });
+
+            self.bodies
+                .par_iter_mut()
+                .zip(self.states.par_iter())
+                .for_each(|(body, state)| {
+                    self.integrator.apply(
+                        self.time_step,
+                        state,
+                        &mut body.position,
+                        &mut body.velocity,
+                    );
+
+                    body.enforce_periodic_boundary(self.half_size);
+                });
         }
 
-        for (body, state) in self.bodies.iter_mut().zip(self.states.iter()) {
-            self.integrator.apply(
-                self.time_step,
-                state,
-                &mut body.position,
-                &mut body.velocity,
-            );
-            body.enforce_periodic_boundary(self.half_size);
+        #[cfg(not(feature = "multi-thread"))]
+        {
+            for (body, state) in self.bodies.iter().zip(self.states.iter_mut()) {
+                let acceleration = |position| {
+                    self.octree
+                        .acceleration(position, &self.bodies, Some(body.id))
+                };
+
+                self.integrator
+                    .update(self.time_step, body, state, acceleration);
+            }
+
+            for (body, state) in self.bodies.iter_mut().zip(self.states.iter()) {
+                self.integrator.apply(
+                    self.time_step,
+                    state,
+                    &mut body.position,
+                    &mut body.velocity,
+                );
+
+                body.enforce_periodic_boundary(self.half_size);
+            }
         }
 
         self.step += 1;
