@@ -1,6 +1,7 @@
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use empyrean::{
-    body::generators::{self, BodyGenerator, BodyGeneratorExt},
+    body::generators::{self, BodyGeneratorExt},
+    integrator::{EulerMethod, Integrator, RungeKutta},
     simulation::Simulation,
 };
 use glam::DVec3;
@@ -9,23 +10,10 @@ use rand_distr::{Distribution, Gamma};
 
 const HALF_SIZE: f64 = 100.0;
 
-fn simulation_with_bodies(
-    theta: f64,
-    epsilon: f64,
-    time_step: f64,
-    generator: &mut impl BodyGenerator,
-    n: usize,
-) -> Simulation {
-    let mut sim = Simulation::new(theta, epsilon, time_step, HALF_SIZE);
-
-    sim.generate_bodies(generator, n);
-
-    sim
-}
-
-fn simulation_benchmark(c: &mut Criterion) {
-    let mut group = c.benchmark_group("simulation step - normal bodies");
-
+fn new_simulation<I>(integrator: I, n: usize) -> Simulation<I>
+where
+    I: Integrator,
+{
     let mut rng = rand::rng();
 
     let mass = Gamma::new(2.0, 1.0).unwrap();
@@ -39,13 +27,23 @@ fn simulation_benchmark(c: &mut Criterion) {
     .unwrap()
     .modify(|body| body.mass = mass.sample(&mut rng));
 
+    let mut sim = Simulation::new(integrator, 1.0, 1.0, 1.0, HALF_SIZE);
+
+    sim.generate_bodies(&mut generator, n);
+
+    sim
+}
+
+fn simulation_benchmark_runge_kutta(c: &mut Criterion) {
+    let mut runge_kutta_group = c.benchmark_group("simulation step - runge-kutta");
+
     for body_count in (1..=4).map(|p| 10usize.pow(p)) {
-        group.bench_with_input(
+        runge_kutta_group.bench_with_input(
             BenchmarkId::from_parameter(body_count),
             &body_count,
             |b, body_count| {
                 b.iter_batched(
-                    || simulation_with_bodies(1.0, 1.0, 1.0, &mut generator, *body_count),
+                    || new_simulation(RungeKutta, *body_count),
                     |mut sim| sim.step(),
                     BatchSize::LargeInput,
                 )
@@ -54,5 +52,27 @@ fn simulation_benchmark(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, simulation_benchmark);
+fn simulation_benchmark_euler_method(c: &mut Criterion) {
+    let mut euler_method_group = c.benchmark_group("simulation step - euler method");
+
+    for body_count in (1..=4).map(|p| 10usize.pow(p)) {
+        euler_method_group.bench_with_input(
+            BenchmarkId::from_parameter(body_count),
+            &body_count,
+            |b, body_count| {
+                b.iter_batched(
+                    || new_simulation(EulerMethod, *body_count),
+                    |mut sim| sim.step(),
+                    BatchSize::LargeInput,
+                )
+            },
+        );
+    }
+}
+
+criterion_group!(
+    benches,
+    simulation_benchmark_runge_kutta,
+    simulation_benchmark_euler_method
+);
 criterion_main!(benches);
