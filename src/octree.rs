@@ -1,13 +1,17 @@
-use std::{iter, num::NonZeroUsize, ops::Range};
+#[cfg(feature = "multi-thread")]
+use std::sync::atomic::AtomicUsize;
+use std::{num::NonZeroUsize, ops::Range};
 
-use glam::DVec3;
+use glam::{DVec3, dvec3};
+#[cfg(feature = "multi-thread")]
+use rayon::Scope;
 
 use crate::{
     body::{Body, BodyId},
     utils::{partition, periodic_boundary_distance_direction},
 };
 
-const LEAF_CAPACITY: usize = 4;
+const LEAF_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone, Copy)]
 struct Octant {
@@ -16,35 +20,26 @@ struct Octant {
 }
 
 impl Octant {
-    fn subdivide(self) -> impl Iterator<Item = Self> {
-        (0..8).map(move |i| {
-            let half_size = self.half_size / 2.0;
+    #[rustfmt::skip]
+    fn subdivide(self) -> [Self; 8] {
+        let half_size = self.half_size / 2.0;
 
-            let mut center = self.center;
-
-            center.x += if i & 0b001 != 0 {
-                half_size
-            } else {
-                -half_size
-            };
-            center.y += if i & 0b010 != 0 {
-                half_size
-            } else {
-                -half_size
-            };
-            center.z += if i & 0b100 != 0 {
-                half_size
-            } else {
-                -half_size
-            };
-
-            Self { center, half_size }
-        })
+        [
+            Self { center: self.center + dvec3(-half_size, -half_size, -half_size), half_size },
+            Self { center: self.center + dvec3( half_size, -half_size, -half_size), half_size },
+            Self { center: self.center + dvec3(-half_size,  half_size, -half_size), half_size },
+            Self { center: self.center + dvec3( half_size,  half_size, -half_size), half_size },
+            Self { center: self.center + dvec3(-half_size, -half_size,  half_size), half_size },
+            Self { center: self.center + dvec3( half_size, -half_size,  half_size), half_size },
+            Self { center: self.center + dvec3(-half_size,  half_size,  half_size), half_size },
+            Self { center: self.center + dvec3( half_size,  half_size,  half_size), half_size },
+        ]
     }
 }
 
 type NonRootNodeIndex = NonZeroUsize;
 
+#[derive(Debug, Clone)]
 struct Node {
     /// A reference to the this node's first child.
     pub children: Option<NonRootNodeIndex>,
@@ -64,6 +59,17 @@ struct Node {
 }
 
 impl Node {
+    pub const fn empty() -> Self {
+        Self::new(
+            None,
+            Octant {
+                center: DVec3::ZERO,
+                half_size: 0.0,
+            },
+            0..0,
+        )
+    }
+
     pub const fn new(next: Option<NonRootNodeIndex>, octant: Octant, bodies: Range<usize>) -> Self {
         Self {
             children: None,
@@ -102,6 +108,7 @@ impl Node {
 /// │ │       │       │    │ │       │       │
 /// │ └───────┴───────┘    │ └───────┴───────┘
 /// └─────────X────────▶   └─────────X────────▶
+#[derive(Debug)]
 pub struct Octree {
     /// All nodes within the [`Octree`].
     ///
@@ -158,7 +165,10 @@ impl Octree {
     }
 
     #[rustfmt::skip]
+    #[cfg(not(feature = "multi-thread"))]
     fn subdivide(&mut self, node: usize, bodies: &mut [Body], range: Range<usize>) {
+        use std::iter;
+
         let center = self.nodes[node].octant.center;
 
         const START: usize = 0;
@@ -238,12 +248,215 @@ impl Octree {
         );
     }
 
+    #[cfg(feature = "multi-thread")]
+    fn handle_node<'scope>(
+        s: &Scope<'scope>,
+        tx: crossbeam_channel::Sender<(usize, Node)>,
+        next_index: &'scope AtomicUsize,
+        octant: Octant,
+        index: usize,
+        next: Option<NonRootNodeIndex>,
+        bodies: &'scope mut [Body],
+        range: Range<usize>,
+    ) {
+        use std::sync::atomic::Ordering;
+
+        let mut node = Node::new(next, octant, range.clone());
+
+        if bodies.len() > LEAF_CAPACITY {
+            let center = node.octant.center;
+
+            const START: usize = 0;
+
+            const SPLIT_X_1: usize = 1;
+            const SPLIT_X_2: usize = 3;
+            const SPLIT_X_3: usize = 5;
+            const SPLIT_X_4: usize = 7;
+
+            const SPLIT_Y_1: usize = 2;
+            const SPLIT_Y_2: usize = 6;
+
+            const SPLIT_Z_1: usize = 4;
+
+            const END: usize = 8;
+
+            let mut splits = [
+                0,
+                0, // 1 - 1st X split
+                0, // 2 - 1st Y split
+                0, // 3 - 2nd X split
+                0, // 4 - 1st Z split
+                0, // 5 - 3rd X split
+                0, // 6 - 2nd Y split
+                0, // 7 - 4th X split
+                bodies.len(),
+            ];
+
+            let predicate = |body: &Body| body.position.z < center.z;
+            splits[SPLIT_Z_1] =
+                splits[START] + partition(&mut bodies[splits[START]..splits[END]], predicate);
+
+            let predicate = |body: &Body| body.position.y < center.y;
+            splits[SPLIT_Y_1] =
+                splits[START] + partition(&mut bodies[splits[START]..splits[SPLIT_Z_1]], predicate);
+            splits[SPLIT_Y_2] = splits[SPLIT_Z_1]
+                + partition(&mut bodies[splits[SPLIT_Z_1]..splits[END]], predicate);
+
+            let predicate = |body: &Body| body.position.x < center.x;
+            splits[SPLIT_X_1] =
+                splits[START] + partition(&mut bodies[splits[START]..splits[SPLIT_Y_1]], predicate);
+            splits[SPLIT_X_2] = splits[SPLIT_Y_1]
+                + partition(&mut bodies[splits[SPLIT_Y_1]..splits[SPLIT_Z_1]], predicate);
+            splits[SPLIT_X_3] = splits[SPLIT_Z_1]
+                + partition(&mut bodies[splits[SPLIT_Z_1]..splits[SPLIT_Y_2]], predicate);
+            splits[SPLIT_X_4] = splits[SPLIT_Y_2]
+                + partition(&mut bodies[splits[SPLIT_Y_2]..splits[END]], predicate);
+
+            let children_index = next_index.fetch_add(8, Ordering::Relaxed);
+
+            let nexts = [
+                NonZeroUsize::new(children_index + 1),
+                NonZeroUsize::new(children_index + 2),
+                NonZeroUsize::new(children_index + 3),
+                NonZeroUsize::new(children_index + 4),
+                NonZeroUsize::new(children_index + 5),
+                NonZeroUsize::new(children_index + 6),
+                NonZeroUsize::new(children_index + 7),
+                node.next,
+            ];
+            let ranges = [
+                splits[0]..splits[1],
+                splits[1]..splits[2],
+                splits[2]..splits[3],
+                splits[3]..splits[4],
+                splits[4]..splits[5],
+                splits[5]..splits[6],
+                splits[6]..splits[7],
+                splits[7]..splits[8],
+            ];
+            let octants = node.octant.subdivide();
+            let bodies = bodies
+                .get_disjoint_mut(ranges.clone())
+                .expect("splits should be disjoint");
+
+            node.children = Some(NonZeroUsize::new(children_index).expect("children is root"));
+
+            tx.send((index, node)).expect("channel closed");
+
+            for (i, ((octant, next), (local_range, bodies))) in (children_index..children_index + 8)
+                .zip((octants.into_iter().zip(nexts)).zip(ranges.into_iter().zip(bodies)))
+            {
+                let tx = tx.clone();
+
+                // The range given is shifted by the range passed in
+                let range = (range.start + local_range.start)..(range.start + local_range.end);
+
+                s.spawn(move |s| {
+                    Self::handle_node(s, tx, next_index, octant, i, next, bodies, range)
+                });
+            }
+        } else {
+            // Compute center of mass for this node.
+            for body in bodies {
+                // Center of mass remains weighted by the total mass, will be divided later.
+                node.center_of_mass += body.position * body.mass;
+                node.mass += body.mass;
+            }
+
+            tx.send((index, node)).expect("channel closed");
+        }
+    }
+
     /// Clears and rebuilds this [`Octree`] from the bodies passed in.
     ///
     /// This method rearranges `bodies` such that each of the octree's nodes is able to index a
     /// slice of bodies belonging to it.
     ///
     /// * `bodies`: the bodies to rebuild with
+    #[cfg(feature = "multi-thread")]
+    pub fn build(&mut self, bodies: &mut [Body]) {
+        use std::iter::repeat_n;
+        use std::sync::atomic::AtomicUsize;
+
+        use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
+
+        self.clear();
+
+        // We can expect to need at least bodies.len() / LEAF_CAPACITY new nodes for the leaf
+        // nodes.
+        self.nodes.reserve(bodies.len() / LEAF_CAPACITY);
+
+        let root_octant = Octant {
+            center: DVec3::ZERO,
+            half_size: self.half_size,
+        };
+
+        let next_index = AtomicUsize::new(1);
+
+        let (tx, rx) = crossbeam_channel::bounded::<(usize, Node)>(8);
+
+        rayon::scope(|s| {
+            s.spawn(|_| {
+                while let Ok((index, node)) = rx.recv() {
+                    self.nodes.extend(repeat_n(
+                        Node::empty(),
+                        (index + 1).saturating_sub(self.nodes.len()),
+                    ));
+
+                    if node.children.is_some() {
+                        self.parents.push(index);
+                    }
+
+                    self.nodes[index] = node;
+                }
+            });
+
+            s.spawn(|s| {
+                Self::handle_node(
+                    s,
+                    tx,
+                    &next_index,
+                    root_octant,
+                    Self::ROOT_INDEX,
+                    None,
+                    bodies,
+                    0..bodies.len(),
+                );
+            });
+        });
+
+        // Here we propagate the centers of mass up the tree.
+        for &index in self.parents.iter().rev() {
+            let Some(children_range) = self.nodes[index].children_range() else {
+                unreachable!();
+            };
+
+            let mut center_of_mass = DVec3::ZERO;
+            let mut mass = 0.0;
+
+            for child in &self.nodes[children_range] {
+                center_of_mass += child.center_of_mass;
+                mass += child.mass;
+            }
+
+            self.nodes[index].center_of_mass = center_of_mass;
+            self.nodes[index].mass = mass;
+        }
+
+        self.nodes.par_iter_mut().for_each(|node| {
+            if node.mass != 0.0 {
+                node.center_of_mass /= node.mass;
+            }
+        });
+    }
+
+    /// Clears and rebuilds this [`Octree`] from the bodies passed in.
+    ///
+    /// This method rearranges `bodies` such that each of the octree's nodes is able to index a
+    /// slice of bodies belonging to it.
+    ///
+    /// * `bodies`: the bodies to rebuild with
+    #[cfg(not(feature = "multi-thread"))]
     pub fn build(&mut self, bodies: &mut [Body]) {
         self.clear();
 

@@ -1,6 +1,7 @@
 use std::iter::repeat_with;
 
 use glam::DVec3;
+#[cfg(feature = "multi-thread")]
 use rayon::prelude::*;
 use thiserror::Error;
 

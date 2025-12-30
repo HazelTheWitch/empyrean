@@ -32,10 +32,11 @@ description.workspace = true
 license.workspace = true
 
 [features]
-default = ["multi-thread"]
-multi-thread = ["dep:rayon"]
+default = []
+multi-thread = ["dep:rayon", "dep:crossbeam-channel"]
 
 [dependencies]
+crossbeam-channel = { version = "0.5.15", optional = true }
 glam.workspace = true
 rand.workspace = true
 rand_distr.workspace = true
